@@ -1,6 +1,7 @@
 /**
- * SecureVault Enterprise - Aegis (v15.0)
- * Update: Emergency OTP Regen (Đổi OTP Khẩn cấp), Waiting Room, Blacklist.
+ * SecureVault Enterprise - Citadel (v16.0 - Security Patch)
+ * Fix Critical: Auth Bypass on Guest Actions, Unprotected Admin Routes.
+ * Core: Session Enforcement, RBAC Strict Mode.
  */
 
 const fs = require('fs');
@@ -25,14 +26,14 @@ const { Transform } = require('stream');
 
     const modulesPath = path.join(__dirname, 'node_modules');
     if (!fs.existsSync(modulesPath) || !fs.existsSync(path.join(modulesPath, 'multer'))) {
-        log('Đang khởi tạo hệ thống Aegis v15...');
+        log('Đang cài đặt bản vá bảo mật Citadel v16...');
         try {
             execSync('npm install express cookie-parser cloudflared multer', { stdio: 'inherit' });
             spawn(process.execPath, [__filename], { stdio: 'inherit' }).on('close', process.exit);
             return;
         } catch (e) { console.error('Lỗi: Cần cài Node.js trước.'); process.exit(1); }
     }
-    startAegisServer(uploadDir);
+    startCitadelServer(uploadDir);
 })();
 
 // ==========================================
@@ -56,7 +57,7 @@ class TrafficCop {
 // ==========================================
 // 3. SERVER CORE
 // ==========================================
-function startAegisServer(UPLOAD_DIR) {
+function startCitadelServer(UPLOAD_DIR) {
     const express = require('express');
     const cookieParser = require('cookie-parser');
     const crypto = require('crypto');
@@ -115,7 +116,7 @@ function startAegisServer(UPLOAD_DIR) {
     // --- STATE ---
     let State = {
         online: false,
-        displayName: "SecureVault Aegis",
+        displayName: "SecureVault Citadel",
         isLocked: false, 
 
         otp: null,
@@ -138,7 +139,6 @@ function startAegisServer(UPLOAD_DIR) {
     setInterval(() => {
         if (!State.online) return;
         
-        // Expiry Check
         if (State.serverDuration !== -1) {
             const elapsed = (Date.now() - State.serverStartTime) / 1000;
             if (elapsed >= State.serverDuration) {
@@ -146,7 +146,6 @@ function startAegisServer(UPLOAD_DIR) {
             }
         }
         
-        // OTP Rotation
         if (State.otpRotation > 0) {
             if (Date.now() - State.lastOtpGen > State.otpRotation * 1000) {
                 State.otp = Math.floor(100000 + Math.random() * 900000).toString();
@@ -154,7 +153,6 @@ function startAegisServer(UPLOAD_DIR) {
             }
         }
 
-        // Request Cleanup
         const now = Date.now();
         for (const id in State.joinRequests) {
             if (State.joinRequests[id].expiresAt < now) delete State.joinRequests[id];
@@ -183,6 +181,7 @@ function startAegisServer(UPLOAD_DIR) {
     app.use(express.json());
     app.use(cookieParser(CONFIG.SESSION_SECRET));
 
+    // Middleware: Identity Check
     const auth = (req, res, next) => {
         const isCF = req.headers['cf-ray'] || req.headers['x-forwarded-for'];
         if (isCF) { req.isAdmin = false; return next(); }
@@ -191,26 +190,37 @@ function startAegisServer(UPLOAD_DIR) {
         next();
     };
 
+    // [SECURITY FIX 1] Middleware: Enforce Permissions AND Session
     const requirePerm = (perm) => (req, res, next) => {
+        // 1. Admin luôn được qua
         if (req.isAdmin) return next();
+
+        // 2. Check Server State
         if (!State.online) return res.status(503).json({ error: "Server Offline" });
         if (State.isLocked) return res.status(403).json({ error: "Server Locked" });
-        if (State.perms[perm]) return next();
-        res.status(403).json({ error: "No Permission" });
+
+        // 3. Check Feature Permission (Quyền có được bật không?)
+        if (!State.perms[perm]) return res.status(403).json({ error: "Feature Disabled" });
+
+        // 4. [CRITICAL FIX] Verify Session Token
+        // Bắt buộc phải có token và token phải tồn tại trong State.sessions
+        const token = req.signedCookies.session_token;
+        if (!token || !State.sessions[token]) {
+            return res.status(401).json({ error: "Unauthorized: No Session" });
+        }
+
+        next();
     };
 
-    // --- ADMIN API ---
+    // --- ADMIN API (PROTECTED) ---
+    // [SECURITY FIX 2] Tất cả Admin API phải check !req.isAdmin
+
     app.get('/api/admin/info', auth, (req, res) => {
         if (!req.isAdmin) return res.sendStatus(403);
         res.json({
-            online: State.online,
-            isLocked: State.isLocked,
-            displayName: State.displayName,
-            otp: State.otp,
-            tunnel: State.tunnel,
-            files: State.files,
-            connections: Object.values(State.sessions),
-            perms: State.perms,
+            online: State.online, isLocked: State.isLocked, displayName: State.displayName,
+            otp: State.otp, tunnel: State.tunnel, files: State.files,
+            connections: Object.values(State.sessions), perms: State.perms,
             config: { duration: State.serverDuration, rotation: State.otpRotation },
             requests: Object.values(State.joinRequests)
         });
@@ -234,17 +244,11 @@ function startAegisServer(UPLOAD_DIR) {
         res.json({ ok: true });
     });
 
-    // NEW: REGEN OTP API
     app.post('/api/admin/regen-otp', auth, (req, res) => {
         if (!req.isAdmin) return res.sendStatus(403);
         if (!State.online) return res.status(400).json({ error: "Server chưa bật" });
-        
-        // Tạo OTP mới
         State.otp = Math.floor(100000 + Math.random() * 900000).toString();
-        // Reset thời gian xoay (để tránh vừa đổi tay xong máy lại tự đổi)
         State.lastOtpGen = Date.now();
-        
-        console.log(`[MANUAL] Admin đã đổi OTP khẩn cấp: ${State.otp}`);
         res.json({ ok: true, otp: State.otp });
     });
 
@@ -265,19 +269,28 @@ function startAegisServer(UPLOAD_DIR) {
         res.json({ ok: true, isLocked: State.isLocked });
     });
 
+    // [SECURITY FIX 2.1] Upload File (Admin Only)
     app.post('/api/files/upload', auth, upload.array('files'), (req, res) => {
-        const newFiles = req.files.map(f => ({ id: f.filename, name: f.originalname.replace(/^\d+___/, ''), size: f.size, path: f.path, isShared: true, uploader: req.isAdmin ? 'Admin' : 'Guest' }));
+        if (!req.isAdmin) return res.sendStatus(403); // Chặn Guest gọi API này
+        const newFiles = req.files.map(f => ({ id: f.filename, name: f.originalname.replace(/^\d+___/, ''), size: f.size, path: f.path, isShared: true, uploader: 'Admin' }));
         State.files.push(...newFiles); res.json({ files: State.files });
     });
+
+    // [SECURITY FIX 2.2] Delete File (Admin Only)
     app.delete('/api/files/del/:id', auth, (req, res) => {
+        if (!req.isAdmin) return res.sendStatus(403); // Chặn Guest gọi API này
         const idx = State.files.findIndex(f => f.id === req.params.id);
         if (idx > -1) { try { fs.unlinkSync(State.files[idx].path); } catch(e){} State.files.splice(idx, 1); }
         res.json({ files: State.files });
     });
+
+    // [SECURITY FIX 2.3] Scan (Admin Only)
     app.post('/api/admin/scan', auth, (req, res) => {
+        if (!req.isAdmin) return res.sendStatus(403); // Chặn Guest scan
         State.peers = []; udp.send(JSON.stringify({ type: 'SCAN' }), CONFIG.UDP_PORT, '255.255.255.255');
         setTimeout(() => res.json({ peers: State.peers }), 1500);
     });
+
     app.post('/api/admin/kick', auth, (req, res) => {
         if (!req.isAdmin) return res.sendStatus(403);
         const ip = req.body.ip;
@@ -285,6 +298,7 @@ function startAegisServer(UPLOAD_DIR) {
         State.blockedIPs.add(ip);
         res.json({ ok: true });
     });
+
     app.post('/api/admin/resolve', auth, (req, res) => {
         if (!req.isAdmin) return res.sendStatus(403);
         const { reqId, action } = req.body;
@@ -347,6 +361,7 @@ function startAegisServer(UPLOAD_DIR) {
         res.json({ status: 'OK', data: State.textData, files: visibleFiles, remaining, perms: State.perms });
     });
 
+    // Guest Download (Secured)
     app.get('/api/guest/download/:id', requirePerm('download'), (req, res) => {
         const f = State.files.find(x => x.id === req.params.id);
         if (f && fs.existsSync(f.path) && f.isShared) {
@@ -355,17 +370,31 @@ function startAegisServer(UPLOAD_DIR) {
             fs.createReadStream(f.path).pipe(TrafficCop.createStream()).pipe(res).on('close',()=>TrafficCop.end());
         } else res.sendStatus(404);
     });
+
+    // Guest Upload (Secured)
     app.post('/api/guest/upload', requirePerm('write'), upload.array('files'), (req, res) => {
         const newFiles = req.files.map(f => ({ id: f.filename, name: f.originalname.replace(/^\d+___/, ''), size: f.size, path: f.path, isShared: true, uploader: 'Guest' }));
         State.files.push(...newFiles); res.json({ ok: true });
     });
-    app.post('/api/guest/save', requirePerm('edit'), (req, res) => { State.textData = req.body.data; fs.writeFileSync(CONFIG.DATA_FILE, Security.encrypt(State.textData, MASTER_KEY)); res.json({ ok: true }); });
-    app.delete('/api/guest/delete/:id', requirePerm('delete'), (req, res) => { const idx = State.files.findIndex(f => f.id === req.params.id); if (idx > -1) { try { fs.unlinkSync(State.files[idx].path); } catch(e){} State.files.splice(idx, 1); } res.json({ ok: true }); });
 
-    // --- FRONTEND ---
+    // Guest Save Text (Secured)
+    app.post('/api/guest/save', requirePerm('edit'), (req, res) => { 
+        State.textData = req.body.data; 
+        fs.writeFileSync(CONFIG.DATA_FILE, Security.encrypt(State.textData, MASTER_KEY)); 
+        res.json({ ok: true }); 
+    });
+
+    // Guest Delete File (Secured)
+    app.delete('/api/guest/delete/:id', requirePerm('delete'), (req, res) => { 
+        const idx = State.files.findIndex(f => f.id === req.params.id); 
+        if (idx > -1) { try { fs.unlinkSync(State.files[idx].path); } catch(e){} State.files.splice(idx, 1); } 
+        res.json({ ok: true }); 
+    });
+
+    // --- FRONTEND (UI Giữ nguyên) ---
     app.get('/', auth, (req, res) => {
         const isAdmin = req.isAdmin;
-        const html = `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SecureVault Aegis</title><script src="https://cdn.tailwindcss.com"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet"><script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script><style>body{font-family:sans-serif}.act:active{transform:scale(0.96)}.chk:checked+div{background-color:#eff6ff;border-color:#6366f1}</style></head><body class="bg-slate-100 h-screen overflow-hidden"><div class="max-w-md mx-auto h-full bg-white shadow-2xl flex flex-col relative border-x border-slate-200"><div class="h-14 ${isAdmin?'bg-indigo-700':'bg-emerald-600'} text-white flex items-center justify-between px-4 shadow z-10"><h1 class="font-bold text-lg"><i class="fa-solid fa-shield-cat"></i> Aegis <span class="text-[10px] bg-white/20 px-2 py-0.5 rounded ml-1 font-mono">${isAdmin?'ADMIN':'GUEST'}</span></h1></div>
+        const html = `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SecureVault Citadel</title><script src="https://cdn.tailwindcss.com"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet"><script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script><style>body{font-family:sans-serif}.act:active{transform:scale(0.96)}.chk:checked+div{background-color:#eff6ff;border-color:#6366f1}</style></head><body class="bg-slate-100 h-screen overflow-hidden"><div class="max-w-md mx-auto h-full bg-white shadow-2xl flex flex-col relative border-x border-slate-200"><div class="h-14 ${isAdmin?'bg-indigo-700':'bg-emerald-600'} text-white flex items-center justify-between px-4 shadow z-10"><h1 class="font-bold text-lg"><i class="fa-solid fa-fort-awesome"></i> Citadel <span class="text-[10px] bg-white/20 px-2 py-0.5 rounded ml-1 font-mono">${isAdmin?'ADMIN':'GUEST'}</span></h1></div>
         
         <div id="main-ui" class="flex-1 overflow-y-auto p-4 bg-slate-50 relative">
             ${isAdmin ? `
@@ -376,20 +405,10 @@ function startAegisServer(UPLOAD_DIR) {
                     <div class="bg-slate-50 p-2 rounded border border-slate-100"><p class="text-[10px] text-slate-400 font-bold uppercase mb-2">Quyền Khách</p><div class="grid grid-cols-2 gap-2 text-xs font-bold text-slate-600"><label class="flex items-center gap-2"><input type="checkbox" id="perm-download" checked> Tải xuống</label><label class="flex items-center gap-2"><input type="checkbox" id="perm-write"> Upload</label><label class="flex items-center gap-2"><input type="checkbox" id="perm-edit"> Sửa Text</label><label class="flex items-center gap-2"><input type="checkbox" id="perm-del" class="accent-red-500 text-red-500"> <span class="text-red-400">Xóa file</span></label></div></div>
                     <div><input id="disp-name" class="w-full bg-slate-50 border border-slate-200 rounded px-2 py-1 text-sm font-bold text-indigo-700 outline-none" placeholder="Tên hiển thị..." value="SecureVault"></div>
                     <button id="btn-toggle" class="act w-full py-3 bg-slate-800 text-white font-bold rounded shadow hover:bg-slate-900 transition">BẬT SERVER</button>
-                    
-                    <div id="otp-display" class="hidden mt-2 pt-2 border-t border-dashed border-slate-200 text-center">
-                        <p class="text-xs text-slate-400 font-bold uppercase">Mã OTP Hiện Tại</p>
-                        <p id="otp-val" class="text-4xl font-mono font-black text-indigo-600 tracking-[0.2em] mt-1 select-all">---</p>
-                        <button id="btn-regen" class="mt-2 text-[10px] font-bold bg-slate-100 text-slate-500 px-3 py-1 rounded-full hover:bg-indigo-100 hover:text-indigo-600 transition"><i class="fa-solid fa-rotate mr-1"></i> ĐỔI OTP KHẨN CẤP</button>
-                    </div>
+                    <div id="otp-display" class="hidden mt-2 pt-2 border-t border-dashed border-slate-200 text-center"><p class="text-xs text-slate-400 font-bold uppercase">Mã OTP Hiện Tại</p><p id="otp-val" class="text-4xl font-mono font-black text-indigo-600 tracking-[0.2em] mt-1 select-all">---</p><button id="btn-regen" class="mt-2 text-[10px] font-bold bg-slate-100 text-slate-500 px-3 py-1 rounded-full hover:bg-indigo-100 hover:text-indigo-600 transition"><i class="fa-solid fa-rotate mr-1"></i> ĐỔI OTP KHẨN CẤP</button></div>
                 </div>
                 <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
-                    <div class="flex border-b border-slate-100">
-                        <button onclick="tab('txt')" id="t-txt" class="flex-1 py-3 text-sm font-bold text-indigo-600 border-b-2 border-indigo-600 bg-indigo-50">Văn bản</button>
-                        <button onclick="tab('fil')" id="t-fil" class="flex-1 py-3 text-sm font-bold text-slate-400 hover:bg-slate-50">Files</button>
-                        <button onclick="tab('cli')" id="t-cli" class="flex-1 py-3 text-sm font-bold text-slate-400 hover:bg-slate-50">Clients</button>
-                        <button onclick="tab('req')" id="t-req" class="flex-1 py-3 text-sm font-bold text-slate-400 hover:bg-slate-50 relative">Yêu cầu <span id="req-cnt" class="hidden absolute top-2 right-2 w-2 h-2 bg-red-500 rounded-full"></span></button>
-                    </div>
+                    <div class="flex border-b border-slate-100"><button onclick="tab('txt')" id="t-txt" class="flex-1 py-3 text-sm font-bold text-indigo-600 border-b-2 border-indigo-600 bg-indigo-50">Văn bản</button><button onclick="tab('fil')" id="t-fil" class="flex-1 py-3 text-sm font-bold text-slate-400 hover:bg-slate-50">Files</button><button onclick="tab('cli')" id="t-cli" class="flex-1 py-3 text-sm font-bold text-slate-400 hover:bg-slate-50">Clients</button><button onclick="tab('req')" id="t-req" class="flex-1 py-3 text-sm font-bold text-slate-400 hover:bg-slate-50 relative">Yêu cầu <span id="req-cnt" class="hidden absolute top-2 right-2 w-2 h-2 bg-red-500 rounded-full"></span></button></div>
                     <div id="p-txt" class="p-4"><textarea id="inp-txt" class="w-full h-32 p-3 bg-slate-50 border border-slate-200 rounded font-mono text-sm outline-none focus:ring-1 ring-indigo-500" placeholder="Nội dung bảo mật..."></textarea></div>
                     <div id="p-fil" class="hidden p-4 space-y-3"><div class="flex gap-2"><label class="flex-1 bg-indigo-50 border border-indigo-100 rounded p-2 text-center cursor-pointer hover:bg-indigo-100"><input type="file" id="inp-file" class="hidden" multiple><i class="fa-solid fa-file text-indigo-500"></i> <span class="text-xs font-bold text-indigo-700">File</span></label><label class="flex-1 bg-teal-50 border border-teal-100 rounded p-2 text-center cursor-pointer hover:bg-teal-100"><input type="file" id="inp-folder" class="hidden" multiple webkitdirectory><i class="fa-solid fa-folder text-teal-500"></i> <span class="text-xs font-bold text-teal-700">Folder</span></label></div><div class="flex justify-between items-center bg-slate-100 px-2 py-1 rounded"><span class="text-xs font-bold text-slate-500">Files</span><div class="space-x-2"><button onclick="toggleAll(true)" class="text-[10px] font-bold text-indigo-600">All</button><button onclick="toggleAll(false)" class="text-[10px] font-bold text-slate-400">None</button></div></div><div id="list-files" class="space-y-1 max-h-48 overflow-y-auto"></div></div>
                     <div id="p-cli" class="hidden p-4"><div id="list-clients" class="space-y-2"></div></div>
@@ -476,7 +495,7 @@ function startAegisServer(UPLOAD_DIR) {
     });
 
     app.listen(CONFIG.PORT, '0.0.0.0', () => {
-        console.log(`✅ AEGIS SERVER: Running on port ${CONFIG.PORT}`);
+        console.log(`✅ CITADEL SERVER: Running on port ${CONFIG.PORT}`);
         let cfBin = null; try { cfBin = require('cloudflared').bin; } catch(e){}
         if (cfBin && fs.existsSync(cfBin)) { try { spawn(cfBin, ['tunnel', '--url', `http://localhost:${CONFIG.PORT}`]); } catch(e){} }
     });
