@@ -1,6 +1,6 @@
 /**
- * SecureVault Enterprise - Equilibrium (v9.0)
- * Update: Upload Folder/File riêng biệt, Auto-Kick Realtime, Cân bằng tải (Traffic Shaping).
+ * SecureVault Enterprise - Aegis (v15.0)
+ * Update: Emergency OTP Regen (Đổi OTP Khẩn cấp), Waiting Room, Blacklist.
  */
 
 const fs = require('fs');
@@ -11,58 +11,43 @@ const dgram = require('dgram');
 const { Transform } = require('stream');
 
 // ==========================================
-// 1. BOOTSTRAP (Tự động cài đặt)
+// 1. BOOTSTRAP
 // ==========================================
 (async function kernelBoot() {
     console.clear();
     const log = (msg) => console.log(`\x1b[36m[SYSTEM]\x1b[0m ${msg}`);
     
-    // 1. Setup thư mục
     const uploadDir = path.join(__dirname, 'uploads');
     if (fs.existsSync(uploadDir)) {
         try { fs.rmSync(uploadDir, { recursive: true, force: true }); } catch(e){}
     }
     fs.mkdirSync(uploadDir);
 
-    // 2. Kiểm tra thư viện
     const modulesPath = path.join(__dirname, 'node_modules');
     if (!fs.existsSync(modulesPath) || !fs.existsSync(path.join(modulesPath, 'multer'))) {
-        log('Đang cập nhật hệ thống lõi (v9.0)...');
+        log('Đang khởi tạo hệ thống Aegis v15...');
         try {
             execSync('npm install express cookie-parser cloudflared multer', { stdio: 'inherit' });
             spawn(process.execPath, [__filename], { stdio: 'inherit' }).on('close', process.exit);
             return;
         } catch (e) { console.error('Lỗi: Cần cài Node.js trước.'); process.exit(1); }
     }
-    
-    startEquilibriumServer(uploadDir);
+    startAegisServer(uploadDir);
 })();
 
 // ==========================================
-// 2. TRAFFIC SHAPER (Cân bằng băng thông)
+// 2. TRAFFIC SHAPER
 // ==========================================
 class TrafficCop {
     static activeDownloads = 0;
-    
     static start() { this.activeDownloads++; }
     static end() { this.activeDownloads = Math.max(0, this.activeDownloads - 1); }
-
-    // Tạo Stream điều tiết
     static createStream() {
         return new Transform({
             transform(chunk, encoding, callback) {
-                // Nếu có > 2 người đang tải, tạo độ trễ nhân tạo để chia sẻ CPU/IO
                 if (TrafficCop.activeDownloads > 2) {
-                    const delay = Math.min(TrafficCop.activeDownloads * 2, 50); // Tối đa 50ms delay
-                    setTimeout(() => {
-                        this.push(chunk);
-                        callback();
-                    }, delay);
-                } else {
-                    // Nếu ít người, xả tối đa tốc độ
-                    this.push(chunk);
-                    callback();
-                }
+                    setTimeout(() => { this.push(chunk); callback(); }, Math.min(TrafficCop.activeDownloads * 2, 50));
+                } else { this.push(chunk); callback(); }
             }
         });
     }
@@ -71,7 +56,7 @@ class TrafficCop {
 // ==========================================
 // 3. SERVER CORE
 // ==========================================
-function startEquilibriumServer(UPLOAD_DIR) {
+function startAegisServer(UPLOAD_DIR) {
     const express = require('express');
     const cookieParser = require('cookie-parser');
     const crypto = require('crypto');
@@ -85,36 +70,20 @@ function startEquilibriumServer(UPLOAD_DIR) {
         SESSION_SECRET: crypto.randomBytes(64).toString('hex')
     };
 
-    // --- MULTER (Xử lý File & Folder) ---
     const storage = multer.diskStorage({
         destination: (req, file, cb) => cb(null, UPLOAD_DIR),
         filename: (req, file, cb) => {
-            // Giữ tên gốc + timestamp
             file.originalname = Buffer.from(file.originalname, 'latin1').toString('utf8');
             cb(null, Date.now() + '___' + file.originalname);
         }
     });
-    // Tăng giới hạn field size để hỗ trợ upload folder lớn
-    const upload = multer({ 
-        storage: storage,
-        limits: { fieldSize: 10 * 1024 * 1024 * 1024 } 
-    });
+    const upload = multer({ storage: storage, limits: { fieldSize: 10 * 1024 * 1024 * 1024 } });
 
-    // --- MẠNG & MÃ HÓA ---
     const getPrimaryIP = () => {
         const interfaces = os.networkInterfaces();
         for (const name of Object.keys(interfaces)) {
             for (const iface of interfaces[name]) {
-                if (iface.family === 'IPv4' && !iface.internal) {
-                    // Ưu tiên 192.168 (LAN) > 10.x (VPN/Corp) > 172.x (Docker/VM)
-                    if(iface.address.startsWith('192.168.')) return iface.address;
-                }
-            }
-        }
-        // Fallback
-        for (const name of Object.keys(interfaces)) {
-            for (const iface of interfaces[name]) {
-                if (iface.family === 'IPv4' && !iface.internal) return iface.address;
+                if (iface.family === 'IPv4' && !iface.internal && iface.address.startsWith('192.168.')) return iface.address;
             }
         }
         return '127.0.0.1';
@@ -143,25 +112,64 @@ function startEquilibriumServer(UPLOAD_DIR) {
     };
     const MASTER_KEY = Security.getKey();
 
+    // --- STATE ---
     let State = {
         online: false,
+        displayName: "SecureVault Aegis",
+        isLocked: false, 
+
         otp: null,
-        otpTTL: 300,
+        otpRotation: 0, 
+        lastOtpGen: 0,
+        serverStartTime: 0,
+        serverDuration: 0,
+        
+        perms: { read: true, download: true, edit: false, write: false, delete: false },
         textData: fs.existsSync(CONFIG.DATA_FILE) ? Security.decrypt(fs.readFileSync(CONFIG.DATA_FILE, 'utf8'), MASTER_KEY) : "",
-        files: [],
+        files: [], 
         tunnel: "Đang khởi tạo...",
-        peers: []
+        peers: [], 
+        sessions: {}, 
+        blockedIPs: new Set(),
+        joinRequests: {}
     };
 
-    // --- UDP DISCOVERY (DUAL-MODE FOR VM) ---
+    // Timer Loop
+    setInterval(() => {
+        if (!State.online) return;
+        
+        // Expiry Check
+        if (State.serverDuration !== -1) {
+            const elapsed = (Date.now() - State.serverStartTime) / 1000;
+            if (elapsed >= State.serverDuration) {
+                State.online = false; State.otp = null; State.sessions = {}; State.isLocked = false; State.blockedIPs.clear(); State.joinRequests = {};
+            }
+        }
+        
+        // OTP Rotation
+        if (State.otpRotation > 0) {
+            if (Date.now() - State.lastOtpGen > State.otpRotation * 1000) {
+                State.otp = Math.floor(100000 + Math.random() * 900000).toString();
+                State.lastOtpGen = Date.now();
+            }
+        }
+
+        // Request Cleanup
+        const now = Date.now();
+        for (const id in State.joinRequests) {
+            if (State.joinRequests[id].expiresAt < now) delete State.joinRequests[id];
+        }
+    }, 1000);
+
+    // UDP
     const udp = dgram.createSocket('udp4');
     udp.on('message', (msg, rinfo) => {
         try {
             const parsed = JSON.parse(msg.toString());
             if (parsed.type === 'SCAN' && State.online) {
-                const myInfo = JSON.stringify({ type: 'PRESENCE', hostname: os.hostname(), ip: getPrimaryIP() });
-                udp.send(myInfo, rinfo.port, rinfo.address, (e)=>{}); // Gửi đích danh (VM cần cái này)
-                udp.send(myInfo, CONFIG.UDP_PORT, '255.255.255.255', (e)=>{}); // Gửi broadcast (App cũ cần cái này)
+                const myInfo = JSON.stringify({ type: 'PRESENCE', hostname: State.displayName, ip: getPrimaryIP() });
+                udp.send(myInfo, rinfo.port, rinfo.address, (e)=>{});
+                udp.send(myInfo, CONFIG.UDP_PORT, '255.255.255.255', (e)=>{});
             }
             if (parsed.type === 'PRESENCE' && parsed.ip !== getPrimaryIP()) {
                 if (!State.peers.find(p => p.ip === parsed.ip)) State.peers.push({ hostname: parsed.hostname, ip: parsed.ip });
@@ -170,177 +178,231 @@ function startEquilibriumServer(UPLOAD_DIR) {
     });
     udp.bind(CONFIG.UDP_PORT, '0.0.0.0', () => { udp.setBroadcast(true); });
 
-    // --- WEB SERVER ---
+    // Express
     const app = express();
     app.use(express.json());
     app.use(cookieParser(CONFIG.SESSION_SECRET));
 
-    const authMiddleware = (req, res, next) => {
-        const ip = req.ip || req.connection.remoteAddress;
-        req.isAdmin = (ip.includes('127.0.0.1') || ip.includes('::1'));
+    const auth = (req, res, next) => {
+        const isCF = req.headers['cf-ray'] || req.headers['x-forwarded-for'];
+        if (isCF) { req.isAdmin = false; return next(); }
+        const ip = req.socket.remoteAddress;
+        req.isAdmin = (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1');
         next();
     };
 
-    // API Heartbeat (Cho phép Client biết Server sống hay chết ngay lập tức)
-    app.get('/api/heartbeat', (req, res) => {
-        if(!State.online) return res.status(503).send('OFFLINE');
-        res.send('ALIVE');
-    });
+    const requirePerm = (perm) => (req, res, next) => {
+        if (req.isAdmin) return next();
+        if (!State.online) return res.status(503).json({ error: "Server Offline" });
+        if (State.isLocked) return res.status(403).json({ error: "Server Locked" });
+        if (State.perms[perm]) return next();
+        res.status(403).json({ error: "No Permission" });
+    };
 
-    // Admin APIs
-    app.get('/api/sys/info', authMiddleware, (req, res) => {
-        res.json({ online: State.online, isAdmin: req.isAdmin, otp: req.isAdmin ? State.otp : null, tunnel: State.tunnel, files: State.files.length, connections: TrafficCop.activeDownloads });
-    });
-
-    app.post('/api/sys/toggle', authMiddleware, (req, res) => {
+    // --- ADMIN API ---
+    app.get('/api/admin/info', auth, (req, res) => {
         if (!req.isAdmin) return res.sendStatus(403);
-        State.online = !State.online;
-        if (State.online) {
-            State.otpTTL = req.body.duration || 300;
-            State.otp = Math.floor(100000 + Math.random() * 900000).toString();
-        } else State.otp = null;
-        res.json({ online: State.online, otp: State.otp });
+        res.json({
+            online: State.online,
+            isLocked: State.isLocked,
+            displayName: State.displayName,
+            otp: State.otp,
+            tunnel: State.tunnel,
+            files: State.files,
+            connections: Object.values(State.sessions),
+            perms: State.perms,
+            config: { duration: State.serverDuration, rotation: State.otpRotation },
+            requests: Object.values(State.joinRequests)
+        });
     });
 
-    app.post('/api/data/save', authMiddleware, (req, res) => {
+    app.post('/api/admin/config', auth, (req, res) => {
         if (!req.isAdmin) return res.sendStatus(403);
-        State.textData = req.body.data;
-        fs.writeFileSync(CONFIG.DATA_FILE, Security.encrypt(State.textData, MASTER_KEY));
+        if (req.body.toggle) {
+            State.online = !State.online;
+            State.isLocked = false; State.blockedIPs.clear(); State.joinRequests = {};
+            if (State.online) {
+                State.serverStartTime = Date.now();
+                State.serverDuration = parseInt(req.body.duration);
+                State.otpRotation = parseInt(req.body.rotation);
+                State.otp = Math.floor(100000 + Math.random() * 900000).toString();
+                State.lastOtpGen = Date.now();
+            } else { State.otp = null; State.sessions = {}; }
+        }
+        if (req.body.displayName) State.displayName = req.body.displayName;
+        if (req.body.perms) State.perms = req.body.perms;
         res.json({ ok: true });
     });
 
-    app.get('/api/data/get', authMiddleware, (req, res) => res.json({ data: State.textData, files: State.files }));
-
-    // Upload (Hỗ trợ cả File và Folder)
-    app.post('/api/files/upload', authMiddleware, upload.array('files'), (req, res) => {
+    // NEW: REGEN OTP API
+    app.post('/api/admin/regen-otp', auth, (req, res) => {
         if (!req.isAdmin) return res.sendStatus(403);
-        const newFiles = req.files.map(f => ({
-            id: f.filename,
-            name: f.originalname.replace(/^\d+___/, ''),
-            size: f.size,
-            path: f.path
-        }));
-        State.files.push(...newFiles);
-        res.json({ files: State.files });
+        if (!State.online) return res.status(400).json({ error: "Server chưa bật" });
+        
+        // Tạo OTP mới
+        State.otp = Math.floor(100000 + Math.random() * 900000).toString();
+        // Reset thời gian xoay (để tránh vừa đổi tay xong máy lại tự đổi)
+        State.lastOtpGen = Date.now();
+        
+        console.log(`[MANUAL] Admin đã đổi OTP khẩn cấp: ${State.otp}`);
+        res.json({ ok: true, otp: State.otp });
     });
 
-    app.delete('/api/files/del/:id', authMiddleware, (req, res) => {
+    app.post('/api/admin/save', auth, (req, res) => {
         if (!req.isAdmin) return res.sendStatus(403);
+        State.textData = req.body.data;
+        fs.writeFileSync(CONFIG.DATA_FILE, Security.encrypt(State.textData, MASTER_KEY));
+        if (req.body.fileStates) {
+            State.files.forEach(f => { if (req.body.fileStates[f.id] !== undefined) f.isShared = req.body.fileStates[f.id]; });
+        }
+        res.json({ ok: true });
+    });
+
+    app.post('/api/admin/lockdown', auth, (req, res) => {
+        if (!req.isAdmin) return res.sendStatus(403);
+        State.isLocked = req.body.locked;
+        if (State.isLocked) State.sessions = {}; 
+        res.json({ ok: true, isLocked: State.isLocked });
+    });
+
+    app.post('/api/files/upload', auth, upload.array('files'), (req, res) => {
+        const newFiles = req.files.map(f => ({ id: f.filename, name: f.originalname.replace(/^\d+___/, ''), size: f.size, path: f.path, isShared: true, uploader: req.isAdmin ? 'Admin' : 'Guest' }));
+        State.files.push(...newFiles); res.json({ files: State.files });
+    });
+    app.delete('/api/files/del/:id', auth, (req, res) => {
         const idx = State.files.findIndex(f => f.id === req.params.id);
         if (idx > -1) { try { fs.unlinkSync(State.files[idx].path); } catch(e){} State.files.splice(idx, 1); }
         res.json({ files: State.files });
     });
-
-    app.post('/api/sys/scan', authMiddleware, (req, res) => {
-        if (!req.isAdmin) return res.sendStatus(403);
-        State.peers = [];
-        udp.send(Buffer.from(JSON.stringify({ type: 'SCAN' })), CONFIG.UDP_PORT, '255.255.255.255');
+    app.post('/api/admin/scan', auth, (req, res) => {
+        State.peers = []; udp.send(JSON.stringify({ type: 'SCAN' }), CONFIG.UDP_PORT, '255.255.255.255');
         setTimeout(() => res.json({ peers: State.peers }), 1500);
     });
+    app.post('/api/admin/kick', auth, (req, res) => {
+        if (!req.isAdmin) return res.sendStatus(403);
+        const ip = req.body.ip;
+        for (let token in State.sessions) { if (State.sessions[token].ip === ip) delete State.sessions[token]; }
+        State.blockedIPs.add(ip);
+        res.json({ ok: true });
+    });
+    app.post('/api/admin/resolve', auth, (req, res) => {
+        if (!req.isAdmin) return res.sendStatus(403);
+        const { reqId, action } = req.body;
+        const request = State.joinRequests[reqId];
+        if (request) {
+            if (action === 'APPROVE') {
+                State.blockedIPs.delete(request.ip);
+                const token = crypto.randomBytes(32).toString('hex');
+                State.sessions[token] = { ip: request.ip, userAgent: request.userAgent };
+                State.joinRequests[reqId].status = 'APPROVED';
+                State.joinRequests[reqId].token = token;
+            } else { delete State.joinRequests[reqId]; }
+        }
+        res.json({ ok: true });
+    });
 
-    // Guest APIs
+    // --- GUEST API ---
     app.post('/api/guest/auth', (req, res) => {
         if (!State.online) return res.status(503).json({ error: "Server Closed" });
+        if (State.isLocked) return res.status(403).json({ error: "⛔ Server đang bị KHÓA." });
+
         if (req.body.otp === State.otp) {
-            const maxAge = State.otpTTL === -1 ? 1000*60*60*24*365 : State.otpTTL * 1000;
-            res.cookie('session_token', State.otp, { maxAge, httpOnly: true, signed: true });
-            res.json({ ok: true, ttl: State.otpTTL });
-        } else res.status(401).json({ error: "Wrong OTP" });
+            const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+            if (State.blockedIPs.has(ip)) {
+                const reqId = crypto.randomBytes(8).toString('hex');
+                State.joinRequests[reqId] = { id: reqId, ip: ip, userAgent: req.headers['user-agent'], expiresAt: Date.now() + 5 * 60 * 1000, status: 'PENDING' };
+                return res.json({ status: 'WAITING', reqId: reqId, ttl: 300 });
+            }
+            const token = crypto.randomBytes(32).toString('hex');
+            State.sessions[token] = { ip: ip, userAgent: req.headers['user-agent'] };
+            res.cookie('session_token', token, { maxAge: 86400000, httpOnly: true, signed: true });
+            res.json({ status: 'OK' });
+        } else { res.status(401).json({ error: "Sai OTP" }); }
     });
 
-    app.get('/api/guest/fetch', (req, res) => {
-        if (!State.online) return res.status(503).json({ error: "Server Offline" });
-        if (req.signedCookies.session_token === State.otp) res.json({ data: State.textData, files: State.files });
-        else res.status(401).json({ error: "Unauthorized" });
+    app.post('/api/guest/check-request', (req, res) => {
+        const { reqId } = req.body;
+        const reqData = State.joinRequests[reqId];
+        if (!reqData) return res.json({ status: 'REJECTED' });
+        if (reqData.status === 'APPROVED') {
+            res.cookie('session_token', reqData.token, { maxAge: 86400000, httpOnly: true, signed: true });
+            delete State.joinRequests[reqId];
+            return res.json({ status: 'APPROVED' });
+        }
+        const remaining = Math.max(0, Math.floor((reqData.expiresAt - Date.now()) / 1000));
+        res.json({ status: 'PENDING', remaining });
     });
 
-    // DOWNLOAD WITH TRAFFIC SHAPING (CÂN BẰNG TẢI)
-    app.get('/api/guest/download/:id', (req, res) => {
-        if (!State.online) return res.sendStatus(503);
-        if (req.signedCookies.session_token !== State.otp) return res.sendStatus(401);
-        
+    app.get('/api/guest/sync', (req, res) => {
+        if(!State.online) return res.status(503).json({ status: 'OFFLINE' });
+        if(State.isLocked) return res.status(401).json({ status: 'KICKED' });
+        const token = req.signedCookies.session_token;
+        if (!token || !State.sessions[token]) return res.status(401).json({ status: 'KICKED' });
+        let remaining = -1;
+        if (State.serverDuration !== -1) {
+            remaining = Math.max(0, State.serverDuration - ((Date.now() - State.serverStartTime) / 1000));
+            if (remaining === 0) return res.status(503).json({ status: 'EXPIRED' });
+        }
+        const visibleFiles = State.files.filter(f => f.isShared);
+        res.json({ status: 'OK', data: State.textData, files: visibleFiles, remaining, perms: State.perms });
+    });
+
+    app.get('/api/guest/download/:id', requirePerm('download'), (req, res) => {
         const f = State.files.find(x => x.id === req.params.id);
-        if (f && fs.existsSync(f.path)) {
-            // Tăng biến đếm người dùng
+        if (f && fs.existsSync(f.path) && f.isShared) {
             TrafficCop.start();
-            
-            // Stream file qua bộ điều tiết (Shaper)
-            const fileStream = fs.createReadStream(f.path);
-            const shaper = TrafficCop.createStream();
-            
             res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(f.name)}"`);
-            
-            // File -> Shaper -> Response
-            fileStream.pipe(shaper).pipe(res);
-
-            // Khi tải xong hoặc lỗi thì giảm biến đếm
-            res.on('close', () => TrafficCop.end());
-            res.on('error', () => TrafficCop.end());
+            fs.createReadStream(f.path).pipe(TrafficCop.createStream()).pipe(res).on('close',()=>TrafficCop.end());
         } else res.sendStatus(404);
     });
+    app.post('/api/guest/upload', requirePerm('write'), upload.array('files'), (req, res) => {
+        const newFiles = req.files.map(f => ({ id: f.filename, name: f.originalname.replace(/^\d+___/, ''), size: f.size, path: f.path, isShared: true, uploader: 'Guest' }));
+        State.files.push(...newFiles); res.json({ ok: true });
+    });
+    app.post('/api/guest/save', requirePerm('edit'), (req, res) => { State.textData = req.body.data; fs.writeFileSync(CONFIG.DATA_FILE, Security.encrypt(State.textData, MASTER_KEY)); res.json({ ok: true }); });
+    app.delete('/api/guest/delete/:id', requirePerm('delete'), (req, res) => { const idx = State.files.findIndex(f => f.id === req.params.id); if (idx > -1) { try { fs.unlinkSync(State.files[idx].path); } catch(e){} State.files.splice(idx, 1); } res.json({ ok: true }); });
 
     // --- FRONTEND ---
-    app.get('/', authMiddleware, (req, res) => {
+    app.get('/', auth, (req, res) => {
         const isAdmin = req.isAdmin;
-        const html = `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SecureVault Equilibrium</title><script src="https://cdn.tailwindcss.com"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet"><script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script><style>body{font-family:sans-serif}.act:active{transform:scale(0.96)}</style></head><body class="bg-slate-100 h-screen overflow-hidden"><div class="max-w-md mx-auto h-full bg-white shadow-2xl flex flex-col relative border-x border-slate-200"><div class="h-14 ${isAdmin?'bg-indigo-700':'bg-emerald-600'} text-white flex items-center justify-between px-4 shadow z-10"><h1 class="font-bold text-lg"><i class="fa-solid fa-scale-balanced"></i> SecureVault <span class="text-[10px] bg-white/20 px-2 py-0.5 rounded ml-1 font-mono">v9.0</span></h1></div>
+        const html = `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SecureVault Aegis</title><script src="https://cdn.tailwindcss.com"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet"><script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script><style>body{font-family:sans-serif}.act:active{transform:scale(0.96)}.chk:checked+div{background-color:#eff6ff;border-color:#6366f1}</style></head><body class="bg-slate-100 h-screen overflow-hidden"><div class="max-w-md mx-auto h-full bg-white shadow-2xl flex flex-col relative border-x border-slate-200"><div class="h-14 ${isAdmin?'bg-indigo-700':'bg-emerald-600'} text-white flex items-center justify-between px-4 shadow z-10"><h1 class="font-bold text-lg"><i class="fa-solid fa-shield-cat"></i> Aegis <span class="text-[10px] bg-white/20 px-2 py-0.5 rounded ml-1 font-mono">${isAdmin?'ADMIN':'GUEST'}</span></h1></div>
         
         <div id="main-ui" class="flex-1 overflow-y-auto p-4 bg-slate-50 relative">
             ${isAdmin ? `
             <div class="space-y-4">
-                <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-                    <div class="flex justify-between items-center mb-4"><span class="font-bold text-slate-700">Control Center</span><span id="stt-badge" class="px-3 py-1 rounded-full text-xs font-bold bg-slate-200 text-slate-500">OFFLINE</span></div>
-                    <div class="flex items-center justify-between gap-2">
-                        <select id="otp-time" class="bg-slate-100 text-sm font-bold text-slate-600 py-2 px-3 rounded border-0 outline-none"><option value="120">2 Phút</option><option value="300" selected>5 Phút</option><option value="1800">30 Phút</option><option value="-1">Vô hạn</option></select>
-                        <button id="btn-toggle" class="act flex-1 py-2 bg-slate-800 text-white font-bold rounded shadow hover:bg-slate-900 transition">BẬT SERVER</button>
+                <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm space-y-3">
+                    <div class="flex justify-between items-center"><span class="font-bold text-slate-700">Trạng Thái</span><span id="stt-badge" class="px-3 py-1 rounded-full text-xs font-bold bg-slate-200 text-slate-500">OFFLINE</span></div>
+                    <div class="grid grid-cols-2 gap-2"><div><p class="text-[10px] text-slate-400 font-bold uppercase mb-1">TG Chia sẻ</p><select id="share-dur" class="w-full bg-slate-50 text-xs font-bold text-slate-700 py-2 px-2 rounded border border-slate-200 outline-none" onchange="updateOtpOptions()"><option value="300">5 Phút</option><option value="600">10 Phút</option><option value="-1">Mãi mãi</option><option value="custom">Tùy chọn...</option></select><input id="share-custom" type="number" class="hidden w-full mt-1 text-xs border rounded p-1" placeholder="Số phút"></div><div><p class="text-[10px] text-slate-400 font-bold uppercase mb-1">Đổi OTP</p><select id="otp-mode" class="w-full bg-slate-50 text-xs font-bold text-slate-700 py-2 px-2 rounded border border-slate-200 outline-none"><option value="0">Theo TG Chia sẻ</option><option value="custom">Tùy chọn</option><option value="-1" id="opt-never" disabled>Không bao giờ</option></select><input id="otp-custom" type="number" class="hidden w-full mt-1 text-xs border rounded p-1" placeholder="Số phút"></div></div>
+                    <div class="bg-slate-50 p-2 rounded border border-slate-100"><p class="text-[10px] text-slate-400 font-bold uppercase mb-2">Quyền Khách</p><div class="grid grid-cols-2 gap-2 text-xs font-bold text-slate-600"><label class="flex items-center gap-2"><input type="checkbox" id="perm-download" checked> Tải xuống</label><label class="flex items-center gap-2"><input type="checkbox" id="perm-write"> Upload</label><label class="flex items-center gap-2"><input type="checkbox" id="perm-edit"> Sửa Text</label><label class="flex items-center gap-2"><input type="checkbox" id="perm-del" class="accent-red-500 text-red-500"> <span class="text-red-400">Xóa file</span></label></div></div>
+                    <div><input id="disp-name" class="w-full bg-slate-50 border border-slate-200 rounded px-2 py-1 text-sm font-bold text-indigo-700 outline-none" placeholder="Tên hiển thị..." value="SecureVault"></div>
+                    <button id="btn-toggle" class="act w-full py-3 bg-slate-800 text-white font-bold rounded shadow hover:bg-slate-900 transition">BẬT SERVER</button>
+                    
+                    <div id="otp-display" class="hidden mt-2 pt-2 border-t border-dashed border-slate-200 text-center">
+                        <p class="text-xs text-slate-400 font-bold uppercase">Mã OTP Hiện Tại</p>
+                        <p id="otp-val" class="text-4xl font-mono font-black text-indigo-600 tracking-[0.2em] mt-1 select-all">---</p>
+                        <button id="btn-regen" class="mt-2 text-[10px] font-bold bg-slate-100 text-slate-500 px-3 py-1 rounded-full hover:bg-indigo-100 hover:text-indigo-600 transition"><i class="fa-solid fa-rotate mr-1"></i> ĐỔI OTP KHẨN CẤP</button>
                     </div>
-                    <div id="otp-display" class="hidden mt-4 pt-4 border-t border-dashed border-slate-200 text-center"><p class="text-xs text-slate-400 font-bold uppercase">Active Connections: <span id="conn-cnt">0</span></p><p id="otp-val" class="text-4xl font-mono font-black text-indigo-600 tracking-[0.2em] mt-1 select-all">---</p></div>
                 </div>
-
                 <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
                     <div class="flex border-b border-slate-100">
                         <button onclick="tab('txt')" id="t-txt" class="flex-1 py-3 text-sm font-bold text-indigo-600 border-b-2 border-indigo-600 bg-indigo-50">Văn bản</button>
-                        <button onclick="tab('fil')" id="t-fil" class="flex-1 py-3 text-sm font-bold text-slate-400 hover:bg-slate-50">Files (<span id="f-cnt">0</span>)</button>
+                        <button onclick="tab('fil')" id="t-fil" class="flex-1 py-3 text-sm font-bold text-slate-400 hover:bg-slate-50">Files</button>
+                        <button onclick="tab('cli')" id="t-cli" class="flex-1 py-3 text-sm font-bold text-slate-400 hover:bg-slate-50">Clients</button>
+                        <button onclick="tab('req')" id="t-req" class="flex-1 py-3 text-sm font-bold text-slate-400 hover:bg-slate-50 relative">Yêu cầu <span id="req-cnt" class="hidden absolute top-2 right-2 w-2 h-2 bg-red-500 rounded-full"></span></button>
                     </div>
-                    <div id="p-txt" class="p-4"><textarea id="inp-txt" class="w-full h-32 p-3 bg-slate-50 border border-slate-200 rounded font-mono text-sm outline-none focus:ring-1 ring-indigo-500" placeholder="Nội dung bảo mật..."></textarea><button id="btn-save" class="act w-full mt-2 py-3 bg-indigo-600 text-white font-bold rounded shadow hover:bg-indigo-700">LƯU DỮ LIỆU</button></div>
-                    
-                    <div id="p-fil" class="hidden p-4 space-y-3">
-                        <div class="grid grid-cols-2 gap-3">
-                            <div class="relative bg-indigo-50 border border-indigo-200 rounded-lg p-4 text-center hover:bg-indigo-100 cursor-pointer transition">
-                                <input type="file" id="inp-file" class="absolute inset-0 opacity-0 cursor-pointer" multiple>
-                                <i class="fa-regular fa-file text-xl text-indigo-500 mb-1"></i><p class="text-xs font-bold text-indigo-700">Gửi File Lẻ</p>
-                            </div>
-                            <div class="relative bg-teal-50 border border-teal-200 rounded-lg p-4 text-center hover:bg-teal-100 cursor-pointer transition">
-                                <input type="file" id="inp-folder" class="absolute inset-0 opacity-0 cursor-pointer" multiple webkitdirectory>
-                                <i class="fa-regular fa-folder-open text-xl text-teal-500 mb-1"></i><p class="text-xs font-bold text-teal-700">Gửi Folder</p>
-                            </div>
-                        </div>
-                        <div id="upload-status" class="hidden text-center text-xs font-bold text-slate-400 animate-pulse">Đang tải lên... vui lòng chờ</div>
-                        <div id="list-files" class="space-y-2 max-h-48 overflow-y-auto"></div>
-                    </div>
+                    <div id="p-txt" class="p-4"><textarea id="inp-txt" class="w-full h-32 p-3 bg-slate-50 border border-slate-200 rounded font-mono text-sm outline-none focus:ring-1 ring-indigo-500" placeholder="Nội dung bảo mật..."></textarea></div>
+                    <div id="p-fil" class="hidden p-4 space-y-3"><div class="flex gap-2"><label class="flex-1 bg-indigo-50 border border-indigo-100 rounded p-2 text-center cursor-pointer hover:bg-indigo-100"><input type="file" id="inp-file" class="hidden" multiple><i class="fa-solid fa-file text-indigo-500"></i> <span class="text-xs font-bold text-indigo-700">File</span></label><label class="flex-1 bg-teal-50 border border-teal-100 rounded p-2 text-center cursor-pointer hover:bg-teal-100"><input type="file" id="inp-folder" class="hidden" multiple webkitdirectory><i class="fa-solid fa-folder text-teal-500"></i> <span class="text-xs font-bold text-teal-700">Folder</span></label></div><div class="flex justify-between items-center bg-slate-100 px-2 py-1 rounded"><span class="text-xs font-bold text-slate-500">Files</span><div class="space-x-2"><button onclick="toggleAll(true)" class="text-[10px] font-bold text-indigo-600">All</button><button onclick="toggleAll(false)" class="text-[10px] font-bold text-slate-400">None</button></div></div><div id="list-files" class="space-y-1 max-h-48 overflow-y-auto"></div></div>
+                    <div id="p-cli" class="hidden p-4"><div id="list-clients" class="space-y-2"></div></div>
+                    <div id="p-req" class="hidden p-4"><p class="text-xs text-slate-400 font-bold uppercase mb-2">Đang chờ duyệt (Bị Kick)</p><div id="list-reqs" class="space-y-2"></div></div>
+                    <div class="p-3 bg-slate-50 border-t border-slate-200 grid grid-cols-2 gap-2"><button id="btn-save" class="act bg-white border border-slate-300 text-slate-700 font-bold py-2 rounded shadow-sm text-xs">LƯU CẤU HÌNH</button><button id="btn-lock" class="act bg-rose-100 text-rose-600 font-bold py-2 rounded shadow-sm text-xs border border-rose-200"><i class="fa-solid fa-lock-open"></i> PHONG TỎA</button></div>
                 </div>
-
-                <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-                    <div class="flex justify-between items-center"><span class="font-bold text-slate-700 text-sm"><i class="fa-solid fa-radar text-indigo-500 mr-1"></i> LAN Radar</span><button id="btn-scan" class="text-xs font-bold text-indigo-600 bg-indigo-100 px-3 py-1 rounded hover:bg-indigo-200">QUÉT</button></div>
-                    <div id="scan-res" class="mt-3 space-y-2"></div>
-                </div>
-                 <div class="text-center"><p class="text-[10px] text-slate-400 font-bold mb-1">CLOUDFLARE LINK</p><a id="cf-link" href="#" target="_blank" class="text-xs font-mono text-indigo-400 font-bold">Waiting...</a></div>
+                 <div class="bg-white p-3 rounded-xl border border-slate-200 shadow-sm flex justify-between items-center"><span class="text-xs font-bold text-indigo-900"><i class="fa-solid fa-radar mr-1"></i> LAN Radar</span><button id="btn-scan" class="text-[10px] bg-indigo-100 text-indigo-700 px-2 py-1 rounded font-bold">QUÉT</button></div>
+                 <div id="scan-res" class="space-y-1"></div>
             </div>
             ` : `
-            <div id="g-login" class="flex flex-col items-center justify-center h-full space-y-6">
-                <div class="w-16 h-16 bg-emerald-100 rounded-full flex items-center justify-center text-emerald-600"><i class="fa-solid fa-lock text-2xl"></i></div>
-                <div class="text-center"><h2 class="font-bold text-slate-700 text-lg">Xác thực quyền</h2><p class="text-xs text-slate-400">Nhập mã OTP từ máy chủ Admin</p></div>
-                <input id="g-otp" type="tel" maxlength="6" class="w-40 text-center text-3xl font-mono border-b-2 border-emerald-500 outline-none bg-transparent tracking-widest py-2" placeholder="••• •••">
-                <button id="btn-auth" class="act w-48 py-3 bg-emerald-600 text-white font-bold rounded-lg shadow-lg shadow-emerald-200">MỞ KHÓA</button>
-                <p id="g-err" class="text-red-500 text-xs font-bold h-4"></p>
-            </div>
-            <div id="g-content" class="hidden h-full flex flex-col">
-                <div class="bg-amber-50 px-4 py-2 flex justify-between items-center text-amber-800 border-b border-amber-100"><span class="text-xs font-bold">AUTO CLOSE</span><span id="timer" class="font-mono font-bold">--:--</span></div>
-                <div class="flex-1 overflow-auto p-4 space-y-4">
-                    <div class="bg-white p-3 rounded border border-slate-200 shadow-sm relative"><button onclick="navigator.clipboard.writeText(document.getElementById('g-txt').innerText);alert('Copied')" class="absolute top-2 right-2 text-slate-400 hover:text-emerald-600"><i class="fa-regular fa-copy"></i></button><pre id="g-txt" class="whitespace-pre-wrap font-mono text-sm text-slate-700"></pre></div>
-                    <div id="g-files" class="space-y-2"></div>
-                </div>
-                <div class="p-4 bg-white border-t border-slate-200"><button onclick="location.reload()" class="w-full py-3 bg-slate-100 text-slate-500 font-bold rounded text-xs hover:bg-slate-200">ĐÓNG PHIÊN</button></div>
-            </div>
+            <div id="g-login" class="flex flex-col items-center justify-center h-full space-y-6"><div class="w-16 h-16 bg-emerald-100 rounded-full flex items-center justify-center text-emerald-600"><i class="fa-solid fa-fingerprint text-3xl"></i></div><div class="text-center"><h2 class="font-bold text-slate-700 text-lg">Đăng nhập</h2><p class="text-xs text-slate-400">Nhập OTP</p></div><input id="g-otp" type="tel" maxlength="6" class="w-40 text-center text-3xl font-mono border-b-2 border-emerald-500 outline-none bg-transparent tracking-widest py-2" placeholder="••• •••"><button id="btn-auth" class="act w-48 py-3 bg-emerald-600 text-white font-bold rounded-lg shadow-lg shadow-emerald-200">VÀO</button><p id="g-err" class="text-red-500 text-xs font-bold h-4 text-center"></p></div>
+            <div id="g-wait" class="hidden flex flex-col items-center justify-center h-full space-y-6 p-6"><div class="w-16 h-16 bg-amber-100 rounded-full flex items-center justify-center text-amber-600 animate-pulse"><i class="fa-solid fa-hourglass-half text-3xl"></i></div><div class="text-center"><h2 class="font-bold text-slate-700 text-lg">Đang chờ duyệt</h2><p class="text-xs text-slate-400 mt-1">Yêu cầu đã được gửi đến Admin</p><p class="text-2xl font-mono font-bold text-amber-500 mt-4" id="wait-time">05:00</p></div><button onclick="location.reload()" class="text-xs font-bold text-slate-400 hover:text-slate-600">Hủy yêu cầu</button></div>
+            <div id="g-content" class="hidden h-full flex flex-col"><div class="bg-amber-50 px-4 py-2 flex justify-between items-center text-amber-800 border-b border-amber-100"><span class="text-xs font-bold"><i class="fa-solid fa-clock"></i> CÒN LẠI</span><span id="timer" class="font-mono font-bold">--:--</span></div><div id="g-tools" class="px-4 py-2 bg-white border-b border-slate-100 flex gap-2 hidden"><label id="btn-g-up" class="hidden flex-1 bg-indigo-50 text-indigo-700 text-xs font-bold py-2 rounded text-center cursor-pointer hover:bg-indigo-100"><input type="file" multiple class="hidden"> <i class="fa-solid fa-upload"></i> Upload</label><button id="btn-g-save" class="hidden flex-1 bg-emerald-50 text-emerald-700 text-xs font-bold py-2 rounded hover:bg-emerald-100"><i class="fa-solid fa-floppy-disk"></i> Lưu Text</button></div><div class="flex-1 overflow-auto p-4 space-y-4"><textarea id="g-txt" class="w-full h-32 p-3 bg-slate-50 border border-slate-200 rounded font-mono text-sm outline-none focus:ring-1 ring-emerald-500" readonly></textarea><div id="g-files" class="space-y-2"></div></div></div>
             `}
         </div></div>
         
@@ -349,126 +411,73 @@ function startEquilibriumServer(UPLOAD_DIR) {
         const fmtSize = s => s<1024?s+' B':s<1024*1024?(s/1024).toFixed(1)+' KB':(s/1024/1024).toFixed(1)+' MB';
 
         ${isAdmin ? `
-        const ui={stt:document.getElementById('stt-badge'),btn:document.getElementById('btn-toggle'),time:document.getElementById('otp-time'),otpBox:document.getElementById('otp-display'),otpVal:document.getElementById('otp-val'),txt:document.getElementById('inp-txt'),fCnt:document.getElementById('f-cnt'),fList:document.getElementById('list-files'),cf:document.getElementById('cf-link'),scanBtn:document.getElementById('btn-scan'),scanRes:document.getElementById('scan-res'), conn:document.getElementById('conn-cnt')};
-        
-        const updateUI = (state) => {
-            ui.stt.innerText = state.online ? "ONLINE" : "OFFLINE";
-            ui.stt.className = "px-3 py-1 rounded-full text-xs font-bold " + (state.online ? "bg-green-100 text-green-700" : "bg-slate-200 text-slate-500");
-            ui.btn.innerText = state.online ? "TẮT SERVER" : "BẬT SERVER";
-            ui.btn.className = "act flex-1 py-2 font-bold rounded shadow transition " + (state.online ? "bg-red-500 text-white hover:bg-red-600" : "bg-slate-800 text-white hover:bg-slate-900");
-            if(state.online) { ui.otpBox.classList.remove('hidden'); ui.otpVal.innerText = state.otp; ui.time.disabled=true; ui.conn.innerText = state.connections; }
-            else { ui.otpBox.classList.add('hidden'); ui.time.disabled=false; }
-            if(state.tunnel && !state.tunnel.includes("Lỗi")) { ui.cf.href = state.tunnel; ui.cf.innerText = state.tunnel; }
+        const ui={stt:document.getElementById('stt-badge'),btn:document.getElementById('btn-toggle'),shDur:document.getElementById('share-dur'),shCust:document.getElementById('share-custom'),otpMode:document.getElementById('otp-mode'),otpCust:document.getElementById('otp-custom'),otpNever:document.getElementById('opt-never'),name:document.getElementById('disp-name'),otpBox:document.getElementById('otp-display'),otpVal:document.getElementById('otp-val'),txt:document.getElementById('inp-txt'),fList:document.getElementById('list-files'),cList:document.getElementById('list-clients'),scanBtn:document.getElementById('btn-scan'),scanRes:document.getElementById('scan-res'), btnLock: document.getElementById('btn-lock'), rList: document.getElementById('list-reqs'), reqCnt: document.getElementById('req-cnt'), btnRegen: document.getElementById('btn-regen')};
+        window.updateOtpOptions = () => { const val=ui.shDur.value; ui.shCust.classList.toggle('hidden',val!=='custom'); if(val==='-1')ui.otpNever.disabled=false; else{ui.otpNever.disabled=true;if(ui.otpMode.value==='-1')ui.otpMode.value='0'} };
+        ui.otpMode.onchange = () => ui.otpCust.classList.toggle('hidden', ui.otpMode.value !== 'custom');
+        let localFiles = []; let isLocked = false;
+        const renderFiles=()=>{ui.fList.innerHTML=localFiles.map(f=>\`<label class="flex items-center gap-3 bg-white p-2 rounded border border-slate-100 cursor-pointer hover:border-indigo-300 transition select-none"><input type="checkbox" class="chk hidden" \${f.isShared?'checked':''} onchange="toggleFile('\${f.id}')"><div class="w-5 h-5 rounded border-2 border-slate-300 flex items-center justify-center text-white text-xs peer-checked:bg-indigo-600 peer-checked:border-indigo-600"><i class="fa-solid fa-check"></i></div><div class="flex-1 min-w-0"><div class="text-xs font-bold text-slate-700 truncate">\${f.name}</div><div class="text-[10px] text-slate-400">\${fmtSize(f.size)} \${f.uploader === 'Guest' ? '(Khách)' : ''}</div></div><button onclick="delFile('\${f.id}', event)" class="w-6 h-6 flex items-center justify-center text-red-300 hover:text-red-500"><i class="fa-solid fa-trash"></i></button></label>\`).join('')};
+        const updateUI = (d) => {
+            ui.stt.innerText = d.online ? "ONLINE" : "OFFLINE"; ui.stt.className = "px-3 py-1 rounded-full text-xs font-bold " + (d.online ? "bg-green-100 text-green-700" : "bg-slate-200 text-slate-500");
+            ui.btn.innerText = d.online ? "TẮT SERVER" : "BẬT SERVER"; ui.btn.className = "act w-full py-3 font-bold rounded shadow transition " + (d.online ? "bg-red-500 text-white hover:bg-red-600" : "bg-slate-800 text-white hover:bg-slate-900");
+            [ui.shDur, ui.shCust, ui.otpMode, ui.otpCust, ui.name].forEach(e => e.disabled = d.online);
+            if(d.online) { ui.otpBox.classList.remove('hidden'); ui.otpVal.innerText = d.otp; } else { ui.otpBox.classList.add('hidden'); }
+            isLocked = d.isLocked; ui.btnLock.innerHTML = isLocked ? '<i class="fa-solid fa-lock"></i> ĐÃ PHONG TỎA (MỞ)' : '<i class="fa-solid fa-lock-open"></i> PHONG TỎA'; ui.btnLock.className = "act font-bold py-2 rounded shadow-sm text-xs border " + (isLocked ? "bg-red-600 text-white border-red-700" : "bg-rose-100 text-rose-600 border-rose-200");
+            ui.cList.innerHTML = d.connections.map(c => \`<div class="flex justify-between items-center bg-slate-50 p-2 rounded border border-slate-200"><div><div class="text-xs font-bold text-slate-700">\${c.ip}</div></div><button onclick="kickUser('\${c.ip}')" class="text-[10px] font-bold bg-red-100 text-red-600 px-2 py-1 rounded hover:bg-red-200">KICK</button></div>\`).join('');
+            if(d.requests && d.requests.length) { ui.reqCnt.classList.remove('hidden'); ui.rList.innerHTML = d.requests.map(r => { const timeLeft = Math.max(0, Math.floor((r.expiresAt - Date.now())/1000)); return \`<div class="bg-amber-50 border border-amber-200 p-2 rounded"><div class="flex justify-between mb-1"><span class="text-xs font-bold text-slate-700">\${r.ip}</span><span class="text-[10px] font-mono text-amber-600">\${Math.floor(timeLeft/60)}:\${(timeLeft%60).toString().padStart(2,'0')}</span></div><div class="flex gap-2"><button onclick="resolveReq('\${r.id}', 'APPROVE')" class="flex-1 bg-green-500 text-white text-[10px] font-bold py-1 rounded hover:bg-green-600">DUYỆT</button><button onclick="resolveReq('\${r.id}', 'REJECT')" class="flex-1 bg-red-400 text-white text-[10px] font-bold py-1 rounded hover:bg-red-500">XÓA</button></div></div>\`; }).join(''); } else { ui.reqCnt.classList.add('hidden'); ui.rList.innerHTML = '<p class="text-center text-xs text-slate-400 italic">Không có yêu cầu nào</p>'; }
         };
 
-        const renderFiles = (files) => {
-            ui.fCnt.innerText = files.length;
-            ui.fList.innerHTML = files.map(f => \`
-                <div class="flex justify-between items-center bg-slate-50 p-2 rounded border border-slate-200">
-                    <div class="overflow-hidden"><div class="text-xs font-bold text-slate-700 truncate">\${f.name}</div><div class="text-[10px] text-slate-400">\${fmtSize(f.size)}</div></div>
-                    <button onclick="delFile('\${f.id}')" class="text-red-400 hover:bg-red-50 w-6 h-6 rounded flex items-center justify-center"><i class="fa-solid fa-trash text-xs"></i></button>
-                </div>\`).join('');
-        };
-
-        setInterval(() => api.get('/sys/info').then(r => updateUI(r.data)), 2000);
-        api.get('/data/get').then(r => { ui.txt.value = r.data.data; renderFiles(r.data.files); });
-
-        ui.btn.onclick = async () => { await api.post('/sys/toggle', {duration: parseInt(ui.time.value)}); api.get('/sys/info').then(r => updateUI(r.data)); };
-        document.getElementById('btn-save').onclick = async () => { await api.post('/data/save', {data: ui.txt.value}); alert('Đã lưu!'); };
-        
-        const handleUpload = async (e) => {
-            if(!e.target.files.length) return;
-            const fd = new FormData();
-            for(let f of e.target.files) fd.append('files', f);
-            document.getElementById('upload-status').classList.remove('hidden');
-            try { await api.post('/files/upload', fd).then(r => renderFiles(r.data.files)); } catch(e){ alert('Lỗi tải file'); }
-            document.getElementById('upload-status').classList.add('hidden');
-            e.target.value = '';
-        };
-        document.getElementById('inp-file').onchange = handleUpload;
-        document.getElementById('inp-folder').onchange = handleUpload;
-
-        window.delFile = (id) => { if(confirm('Xóa?')) api.delete('/files/del/'+id).then(r => renderFiles(r.data.files)); };
-        ui.scanBtn.onclick = async () => {
-            ui.scanBtn.disabled = true; ui.scanBtn.innerText = "...";
-            ui.scanRes.innerHTML = '<div class="text-center py-2 text-xs text-slate-400">Đang tìm kiếm...</div>';
-            try {
-                const res = await api.post('/sys/scan');
-                ui.scanRes.innerHTML = res.data.peers.length ? res.data.peers.map(p => \`
-                    <div onclick="window.open('http://\${p.ip}:3000')" class="flex justify-between items-center bg-indigo-50 p-2 rounded border border-indigo-100 cursor-pointer hover:bg-indigo-100">
-                        <div><div class="text-xs font-bold text-indigo-900">\${p.hostname}</div><div class="text-[10px] text-indigo-500">\${p.ip}</div></div>
-                        <i class="fa-solid fa-arrow-right text-indigo-400 text-xs"></i>
-                    </div>\`).join('') : '<div class="text-center py-2 text-xs text-slate-400 italic">Không tìm thấy thiết bị nào</div>';
-            } catch(e){}
-            ui.scanBtn.disabled = false; ui.scanBtn.innerText = "QUÉT";
-        };
-        window.tab = (m) => {
-            document.getElementById('p-txt').classList.toggle('hidden', m!=='txt');
-            document.getElementById('p-fil').classList.toggle('hidden', m!=='fil');
-        };
+        setInterval(() => api.get('/admin/info').then(r => { updateUI(r.data); localFiles=r.data.files; renderFiles(); }), 2000);
+        api.get('/admin/info').then(r => { const p = r.data.perms; document.getElementById('perm-download').checked = p.download; document.getElementById('perm-write').checked = p.write; document.getElementById('perm-edit').checked = p.edit; document.getElementById('perm-del').checked = p.delete; });
+        ui.btn.onclick = async () => { let dur = ui.shDur.value === 'custom' ? parseInt(ui.shCust.value)*60 : parseInt(ui.shDur.value); let rot = ui.otpMode.value === 'custom' ? parseInt(ui.otpCust.value) : parseInt(ui.otpMode.value); const perms = { download: document.getElementById('perm-download').checked, write: document.getElementById('perm-write').checked, edit: document.getElementById('perm-edit').checked, delete: document.getElementById('perm-del').checked }; await api.post('/admin/config', { toggle: true, duration: dur, rotation: rot, displayName: ui.name.value, perms: perms }); };
+        ui.btnLock.onclick = async () => { await api.post('/admin/lockdown', { locked: !isLocked }); alert(isLocked ? 'Đã MỞ khóa.' : 'Đã PHONG TỎA.'); };
+        ui.btnRegen.onclick = async () => { if(!confirm('Bạn có chắc muốn đổi OTP ngay lập tức?')) return; const r = await api.post('/admin/regen-otp'); ui.otpVal.innerText = r.data.otp; };
+        document.getElementById('btn-save').onclick = () => { const fs = {}; localFiles.forEach(f => fs[f.id] = f.isShared); api.post('/admin/save', { data: ui.txt.value, fileStates: fs }); };
+        const handleUpload = (e) => { if(!e.target.files.length) return; const fd = new FormData(); for(let f of e.target.files) fd.append('files', f); api.post('/files/upload', fd).then(r => { localFiles = r.data.files; renderFiles(); }); e.target.value = ''; };
+        document.getElementById('inp-file').onchange = handleUpload; document.getElementById('inp-folder').onchange = handleUpload;
+        window.toggleFile = (id) => { const f = localFiles.find(x=>x.id===id); if(f) f.isShared = !f.isShared; }; window.toggleAll = (v) => { localFiles.forEach(f => f.isShared = v); renderFiles(); }; window.delFile = (id, e) => { e.preventDefault(); if(confirm('Xóa?')) api.delete('/files/del/'+id); }; window.kickUser = (ip) => api.post('/admin/kick', {ip}); window.resolveReq = (id, act) => api.post('/admin/resolve', {reqId: id, action: act});
+        ui.scanBtn.onclick = async () => { ui.scanRes.innerHTML = '...'; const r = await api.post('/admin/scan'); ui.scanRes.innerHTML = r.data.peers.map(p=>\`<div class="flex justify-between bg-indigo-50 p-1 px-2 rounded border border-indigo-100 text-[10px]"><span class="font-bold">\${p.hostname}</span><span>\${p.ip}</span></div>\`).join(''); };
+        window.tab = (m) => ['txt','fil','cli','req'].forEach(x => { document.getElementById('p-'+x).classList.toggle('hidden', m!==x); document.getElementById('t-'+x).classList.toggle('text-indigo-600', m===x); document.getElementById('t-'+x).classList.toggle('border-indigo-600', m===x); });
         ` : `
-        const ui={l:document.getElementById('g-login'),c:document.getElementById('g-content'),otp:document.getElementById('g-otp'),btn:document.getElementById('btn-auth'),err:document.getElementById('g-err'),txt:document.getElementById('g-txt'),fil:document.getElementById('g-files'),tm:document.getElementById('timer')};
-        let timerInt;
-
-        // REAL-TIME HEARTBEAT CHECK
-        const startHeartbeat = () => {
-            setInterval(async () => {
-                try {
-                    await api.get('/heartbeat');
-                } catch (e) {
-                    // Server chết hoặc trả về 503 -> Đá user ngay lập tức
-                    location.reload(); 
-                }
-            }, 1000); // Check mỗi 1 giây
-        };
-
-        const startTimer = (ttl) => {
-            let s = parseInt(ttl);
-            if(s === -1) { ui.tm.innerText = "∞"; return; }
-            timerInt = setInterval(() => {
-                s--;
+        const ui={l:document.getElementById('g-login'),w:document.getElementById('g-wait'),c:document.getElementById('g-content'),otp:document.getElementById('g-otp'),btn:document.getElementById('btn-auth'),err:document.getElementById('g-err'),txt:document.getElementById('g-txt'),fil:document.getElementById('g-files'),tm:document.getElementById('timer'), wt:document.getElementById('wait-time'), tools:document.getElementById('g-tools'), btnUp:document.getElementById('btn-g-up'), btnSave:document.getElementById('btn-g-save')};
+        let waitInt = null;
+        const startWaiting = (reqId, ttl) => {
+            ui.l.classList.add('hidden'); ui.w.classList.remove('hidden'); let s = ttl;
+            waitInt = setInterval(async () => {
+                s--; ui.wt.innerText = Math.floor(s/60).toString().padStart(2,'0') + ':' + (s%60).toString().padStart(2,'0');
+                if(s%2===0) { const res = await api.post('/guest/check-request', {reqId}); if(res.data.status === 'APPROVED') { clearInterval(waitInt); ui.w.classList.add('hidden'); sync(); } else if(res.data.status === 'REJECTED') { location.reload(); } }
                 if(s<=0) location.reload();
-                ui.tm.innerText = Math.floor(s/60).toString().padStart(2,'0') + ':' + (s%60).toString().padStart(2,'0');
             }, 1000);
         };
-
-        ui.btn.onclick = async () => {
+        const sync = async () => {
             try {
-                ui.btn.innerText = "ĐANG XỬ LÝ..."; ui.err.innerText = "";
-                const auth = await api.post('/guest/auth', {otp: ui.otp.value});
-                const data = await api.get('/guest/fetch');
-                
-                ui.l.classList.add('hidden'); ui.c.classList.remove('hidden');
-                ui.txt.innerText = data.data.data;
-                ui.fil.innerHTML = data.data.files.map(f => \`
-                    <div class="flex justify-between items-center bg-slate-50 p-3 rounded border border-slate-200">
-                        <div class="overflow-hidden"><div class="text-sm font-bold text-slate-700 truncate">\${f.name}</div><div class="text-xs text-slate-400">\${fmtSize(f.size)}</div></div>
-                        <a href="/api/guest/download/\${f.id}" class="bg-emerald-100 text-emerald-700 px-3 py-1.5 rounded text-xs font-bold hover:bg-emerald-200">TẢI</a>
-                    </div>\`).join('');
-                
-                startTimer(auth.data.ttl);
-                startHeartbeat(); // Bắt đầu theo dõi sự sống của server
-            } catch(e) {
-                ui.btn.innerText = "MỞ KHÓA";
-                ui.err.innerText = "Mã OTP không đúng hoặc Server đóng.";
-            }
+                const res = await api.get('/guest/sync');
+                if (res.data.status === 'OK') {
+                    ui.l.classList.add('hidden'); ui.w.classList.add('hidden'); ui.c.classList.remove('hidden');
+                    const perms = res.data.perms; const data = res.data;
+                    if(ui.txt.value !== data.data && document.activeElement !== ui.txt) ui.txt.value = data.data; ui.txt.readOnly = !perms.edit;
+                    let html = data.files.map(f => {
+                        let btns = ''; if(perms.download) btns += \`<a href="/api/guest/download/\${f.id}" class="bg-emerald-100 text-emerald-700 px-3 py-1.5 rounded text-xs font-bold hover:bg-emerald-200">TẢI</a>\`; if(perms.delete) btns += \`<button onclick="delFile('\${f.id}')" class="ml-2 bg-red-100 text-red-700 px-2 py-1.5 rounded text-xs font-bold hover:bg-red-200">XÓA</button>\`;
+                        return \`<div class="flex justify-between items-center bg-slate-50 p-3 rounded border border-slate-200"><div class="min-w-0"><div class="text-sm font-bold text-slate-700 truncate">\${f.name}</div><div class="text-xs text-slate-400">\${fmtSize(f.size)}</div></div><div class="flex">\${btns}</div></div>\`;
+                    }).join('');
+                    if(ui.fil.innerHTML !== html) ui.fil.innerHTML = html;
+                    if(perms.write || perms.edit) ui.tools.classList.remove('hidden'); else ui.tools.classList.add('hidden'); if(perms.write) ui.btnUp.classList.remove('hidden'); else ui.btnUp.classList.add('hidden'); if(perms.edit) ui.btnSave.classList.remove('hidden'); else ui.btnSave.classList.add('hidden');
+                    const rem = data.remaining; if (rem === -1) ui.tm.innerText = "∞"; else if (rem === 0) location.reload(); else ui.tm.innerText = Math.floor(rem/60).toString().padStart(2,'0') + ':' + Math.floor(rem%60).toString().padStart(2,'0');
+                } else { if(ui.c.classList.contains('hidden')) return; location.reload(); }
+            } catch (e) { if(ui.c.classList.contains('hidden')) return; location.reload(); }
         };
+        setInterval(sync, 1000); sync();
+        ui.btn.onclick = async () => { try { ui.btn.innerText = "..."; ui.err.innerText = ""; const res = await api.post('/guest/auth', {otp: ui.otp.value}); if(res.data.status === 'WAITING') { startWaiting(res.data.reqId, res.data.ttl); } else { sync(); ui.btn.innerText = "VÀO"; } } catch(e) { ui.btn.innerText = "VÀO"; ui.err.innerText = e.response?.data?.error || "Lỗi"; } };
+        ui.btnSave.onclick = async () => { await api.post('/guest/save', {data: ui.txt.value}); alert('Đã lưu!'); };
+        ui.btnUp.querySelector('input').onchange = async (e) => { if(!e.target.files.length) return; const fd = new FormData(); for(let f of e.target.files) fd.append('files', f); await api.post('/guest/upload', fd); e.target.value = ''; };
+        window.delFile = (id) => { if(confirm('Xóa file này?')) api.delete('/guest/delete/'+id); };
         `}
         </script></body></html>`;
         res.send(html);
     });
 
     app.listen(CONFIG.PORT, '0.0.0.0', () => {
-        console.log(`✅ EQUILIBRIUM SERVER: Running on port ${CONFIG.PORT}`);
+        console.log(`✅ AEGIS SERVER: Running on port ${CONFIG.PORT}`);
         let cfBin = null; try { cfBin = require('cloudflared').bin; } catch(e){}
-        if (cfBin && fs.existsSync(cfBin)) {
-            try {
-                const tun = spawn(cfBin, ['tunnel', '--url', `http://localhost:${CONFIG.PORT}`]);
-                tun.stderr.on('data', d => {
-                    const m = d.toString().match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
-                    if(m) { State.tunnel = m[0]; console.log(`🌍 INTERNET: ${m[0]}`); }
-                });
-            } catch(e){}
-        }
+        if (cfBin && fs.existsSync(cfBin)) { try { spawn(cfBin, ['tunnel', '--url', `http://localhost:${CONFIG.PORT}`]); } catch(e){} }
     });
 }
